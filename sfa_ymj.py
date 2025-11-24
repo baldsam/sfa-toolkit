@@ -3,10 +3,28 @@
 # dependencies = [
 #     "fastmcp",
 #     "pyyaml",
-#     "fastembed",
+#     "torch>=2.0.0",
+#     "fastembed-gpu",
 #     "numpy",
 # ]
+#
+# [[tool.uv.index]]
+# name = "pytorch-cu121"
+# url = "https://download.pytorch.org/whl/cu121"
+# explicit = true
+#
+# [tool.uv.sources]
+# torch = [
+#     { index = "pytorch-cu121", marker = "sys_platform == 'win32'" },
+# ]
 # ///
+#
+# GPU ACCELERATION NOTES:
+# - fastembed-gpu includes onnxruntime-gpu for CUDA support
+# - PyTorch CUDA 12.1 wheel from pytorch.org index (not PyPI)
+# - Must import torch BEFORE TextEmbedding to preload CUDA DLLs for ONNX Runtime
+# - Must call TextEmbedding with providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+# - Result: 10-14x speedup (32 items/sec CPU -> 447 items/sec GPU @ batch=20)
 
 import argparse
 import hashlib
@@ -19,6 +37,7 @@ from typing import Dict, Any, Optional, List, Tuple
 
 try:
     from fastmcp import FastMCP
+
     mcp = FastMCP("sfa-ymj")
 except ImportError:
     mcp = None
@@ -28,16 +47,22 @@ import yaml
 # --- Global Security ---
 ALLOWED_PATHS: List[Path] = []
 
+
 def _normalize_path(path_str: str) -> Path:
     if not path_str:
         return Path.cwd()
-    if sys.platform == "win32" and path_str.startswith("/") and len(path_str) > 2 and path_str[2] == "/":
+    if (
+        sys.platform == "win32"
+        and path_str.startswith("/")
+        and len(path_str) > 2
+        and path_str[2] == "/"
+    ):
         drive = path_str[1]
         rest = path_str[2:]
         path_str = f"{drive}:{rest}"
-    
+
     path = Path(path_str).resolve()
-    
+
     # Security Check
     if ALLOWED_PATHS:
         is_allowed = False
@@ -48,11 +73,14 @@ def _normalize_path(path_str: str) -> Path:
                 break
             except ValueError:
                 continue
-        
+
         if not is_allowed:
-            raise PermissionError(f"Access denied: Path '{path}' is not in allowed paths.")
-            
+            raise PermissionError(
+                f"Access denied: Path '{path}' is not in allowed paths."
+            )
+
     return path
+
 
 # --- Constants ---
 
@@ -61,6 +89,7 @@ JSON_FENCE_START = "```json"
 JSON_FENCE_END = "```"
 
 # --- Core Logic: Parsing ---
+
 
 class YMJDocument:
     def __init__(self, path: str):
@@ -79,7 +108,7 @@ class YMJDocument:
     def _parse(self):
         """Parse the Sandwich: YAML --- Markdown --- JSON"""
         content = self.raw_content
-        
+
         # 1. Extract YAML Header
         # Must start with ---
         if not content.startswith("---"):
@@ -109,18 +138,20 @@ class YMJDocument:
         if footer_end_idx == -1:
             self.errors.append("Missing JSON footer end fence")
             return
-        
+
         footer_start_idx = content.rfind(JSON_FENCE_START, 0, footer_end_idx)
         if footer_start_idx == -1:
             self.errors.append("Missing JSON footer start fence")
             return
 
         # Verify it's actually at the end (ignoring whitespace)
-        if content[footer_end_idx+3:].strip() != "":
+        if content[footer_end_idx + 3 :].strip() != "":
             self.errors.append("Content found after JSON footer")
             # We continue anyway for resilience
 
-        footer_str = content[footer_start_idx + len(JSON_FENCE_START):footer_end_idx].strip()
+        footer_str = content[
+            footer_start_idx + len(JSON_FENCE_START) : footer_end_idx
+        ].strip()
         try:
             self.footer = json.loads(footer_str)
         except json.JSONDecodeError as e:
@@ -131,14 +162,14 @@ class YMJDocument:
         # Everything between YAML end fence and JSON start fence
         # YAML end fence is at header_end_idx. The fence itself is "\n---" (length 4) or "\n---\n"
         # We need to be careful with indices.
-        
+
         # header_end_idx points to the newline before ---
-        body_start = header_end_idx + 4 # Skip \n---
-        if content[body_start] == '\n': 
-            body_start += 1 # Skip following newline if present
-            
+        body_start = header_end_idx + 4  # Skip \n---
+        if content[body_start] == "\n":
+            body_start += 1  # Skip following newline if present
+
         body_end = footer_start_idx
-        
+
         self.body = content[body_start:body_end].strip()
         self.valid_structure = len(self.errors) == 0
 
@@ -155,111 +186,129 @@ class YMJDocument:
         new_content += "```json\n"
         new_content += json.dumps(self.footer, indent=2, ensure_ascii=False)
         new_content += "\n```\n"
-        
+
         self.path.write_text(new_content, encoding="utf-8")
+
 
 # --- Core Logic: Enrichment ---
 
-def _enrich_document(doc: YMJDocument, use_embeddings: bool = True) -> Dict[str, Any]:
-    """Update payload_hash, keywords, and embeddings."""
+
+def _enrich_document(
+    doc: YMJDocument, use_embeddings: bool = True, force_embedding: bool = False
+) -> Dict[str, Any]:
+    """Update document footer with hash and embeddings."""
     if not doc.valid_structure:
-        return {"error": "Invalid document structure", "details": doc.errors}
+        return {"error": "Invalid structure", "details": doc.errors}
 
     updates = []
-    
-    # 1. Update Hash
+
+    # 1. Hash (Always update if stale)
     current_hash = doc.calculate_hash()
     stored_hash = doc.footer.get("payload_hash")
-    
+
     if current_hash != stored_hash:
         doc.footer["payload_hash"] = current_hash
         updates.append("hash")
-    
-    # 2. Embeddings (if hash changed or missing)
+
+    # 2. Embeddings (if hash changed, missing, or forced)
     # We check if we need to re-embed
-    needs_embedding = "hash" in updates or "index" not in doc.footer or "embedding" not in doc.footer.get("index", {})
-    
+    needs_embedding = (
+        force_embedding
+        or "hash" in updates
+        or "index" not in doc.footer
+        or "embedding" not in doc.footer.get("index", {})
+    )
+
     if use_embeddings and needs_embedding:
         try:
+            # CRITICAL: Import torch first to preload CUDA DLLs for ONNX Runtime
+            import torch
             from fastembed import TextEmbedding
+
             # Initialize model (downloads if needed)
-            embedding_model = TextEmbedding(model_name="nomic-ai/nomic-embed-text-v1.5")
-            
+            embedding_model = TextEmbedding(
+                model_name="nomic-ai/nomic-embed-text-v1.5",
+                providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            )
+
             # Embed the body (truncate if too large? fastembed handles chunking usually, but for doc embedding we might want a summary or full text)
             # For now, embed the whole body
             vectors = list(embedding_model.embed([doc.body]))
-            vector = vectors[0].tolist() # Convert numpy to list
-            
+            vector = vectors[0].tolist()  # Convert numpy to list
+
             if "index" not in doc.footer:
                 doc.footer["index"] = {}
-            
+
             doc.footer["index"]["embedding"] = vector
             doc.footer["index"]["model"] = "nomic-embed-text-v1.5"
             updates.append("embedding")
-            
+
         except Exception as e:
             print(f"Warning: Embedding failed: {e}", file=sys.stderr)
 
     # 3. Keywords (Simple Frequency)
     # TODO: Implement TF-IDF or similar if needed. For now, skip to keep it simple or use LLM later.
-    
+
     if updates:
         doc.save()
         return {"status": "updated", "updates": updates}
     else:
         return {"status": "no_changes"}
 
+
 def _upgrade_document(doc: YMJDocument) -> Dict[str, Any]:
     """Upgrade YMJ document to latest spec compliance."""
     if not doc.valid_structure:
         return {"error": "Invalid structure", "details": doc.errors}
-    
+
     updates = []
-    
+
     # 1. Move payload_sha256 from header to footer payload_hash
     if "payload_sha256" in doc.header:
         del doc.header["payload_sha256"]
         updates.append("removed_header_hash")
-        
+
     # 2. Ensure footer schema version
     if "schema" not in doc.footer:
         doc.footer["schema"] = "1"
         updates.append("added_schema_version")
-        
+
     # 3. Ensure ymj_spec in header
     if "ymj_spec" not in doc.header:
         doc.header["ymj_spec"] = "1.0.0"
         updates.append("added_ymj_spec_version")
-        
+
     # 4. Run enrichment (calculates hash, adds embeddings)
     enrich_res = _enrich_document(doc, use_embeddings=True)
     if enrich_res.get("status") == "updated":
         updates.extend(enrich_res.get("updates", []))
-        
+
     if updates:
         doc.save()
         return {"status": "upgraded", "updates": updates}
-    
+
     return {"status": "already_compliant"}
 
+
 # --- Core Logic: Migration ---
+
 
 def _migrate_md(path: str) -> str:
     """Convert MD to YMJ."""
     p = Path(path)
     if p.suffix == ".ymj":
         return "Already YMJ"
-    
+
     content = p.read_text(encoding="utf-8")
-    
+
     # Basic heuristic to strip existing frontmatter if present
     header = {
         "doc_summary": "Auto-migrated document",
         "kind": "note",
         "version": "1.0.0",
-        "created": "2025-11-19" # Should use file creation time
+        "created": "2025-11-19",  # Should use file creation time
     }
-    
+
     # Check for existing YAML frontmatter
     body = content
     if content.startswith("---"):
@@ -269,45 +318,47 @@ def _migrate_md(path: str) -> str:
             existing_header = yaml.safe_load(fm)
             if isinstance(existing_header, dict):
                 header.update(existing_header)
-            body = content[end_idx+4:].strip()
+            body = content[end_idx + 4 :].strip()
         except:
-            pass # Failed to parse existing frontmatter, treat as body
+            pass  # Failed to parse existing frontmatter, treat as body
 
     # Create YMJ
     new_path = p.with_suffix(".ymj")
-    
+
     doc = YMJDocument(str(new_path))
     # Manually construct since file doesn't exist or we are overwriting
     doc.header = header
     doc.body = body
     doc.footer = {
         "schema": "1",
-        "payload_hash": "", # Will be filled by enrich
-        "index": {}
+        "payload_hash": "",  # Will be filled by enrich
+        "index": {},
     }
     doc.save()
-    
+
     # Enrich immediately to set hash
     doc = YMJDocument(str(new_path))
-    _enrich_document(doc, use_embeddings=False) # Skip embeddings for speed on migration
-    
+    _enrich_document(
+        doc, use_embeddings=False
+    )  # Skip embeddings for speed on migration
+
     return f"Migrated to {new_path}"
+
 
 # --- MCP Tools ---
 
 if mcp:
+
     @mcp.tool()
     def ymj_read(path: str) -> str:
         """Read a YMJ file and return parsed content."""
         doc = YMJDocument(path)
         if not doc.valid_structure:
             return json.dumps({"error": "Invalid YMJ", "details": doc.errors})
-        
-        return json.dumps({
-            "header": doc.header,
-            "body": doc.body,
-            "footer": doc.footer
-        }, indent=2)
+
+        return json.dumps(
+            {"header": doc.header, "body": doc.body, "footer": doc.footer}, indent=2
+        )
 
     @mcp.tool()
     def ymj_lint(path: str) -> str:
@@ -316,7 +367,7 @@ if mcp:
         status = {
             "valid": doc.valid_structure,
             "errors": doc.errors,
-            "stale_hash": False
+            "stale_hash": False,
         }
         if doc.valid_structure:
             calc_hash = doc.calculate_hash()
@@ -324,14 +375,17 @@ if mcp:
             if calc_hash != stored_hash:
                 status["stale_hash"] = True
                 status["errors"].append("Payload hash mismatch (stale footer)")
-        
+
         return json.dumps(status, indent=2)
 
 # --- CLI Dispatcher ---
 
+
 def main():
     parser = argparse.ArgumentParser(description="SFA YMJ - Document Manager")
-    parser.add_argument("--allowed-paths", help="Comma-separated list of allowed paths (MCP security)")
+    parser.add_argument(
+        "--allowed-paths", help="Comma-separated list of allowed paths (MCP security)"
+    )
     subparsers = parser.add_subparsers(dest="command")
 
     # parse
@@ -345,7 +399,21 @@ def main():
     # enrich
     enrich_parser = subparsers.add_parser("enrich", help="Update hash and embeddings")
     enrich_parser.add_argument("path", help="File path")
-    enrich_parser.add_argument("--no-embed", action="store_true", help="Skip vector embeddings")
+    enrich_parser.add_argument(
+        "--no-embed", action="store_true", help="Skip vector embeddings"
+    )
+
+    # enrich-all
+    enrich_all_parser = subparsers.add_parser(
+        "enrich-all", help="Bulk enrich all YMJ files in directory"
+    )
+    enrich_all_parser.add_argument("path", help="Directory path")
+    enrich_all_parser.add_argument(
+        "--no-embed", action="store_true", help="Skip vector embeddings"
+    )
+    enrich_all_parser.add_argument(
+        "--force", action="store_true", help="Regenerate embeddings even if they exist"
+    )
 
     # migrate
     migrate_parser = subparsers.add_parser("migrate", help="Convert MD to YMJ")
@@ -366,11 +434,17 @@ def main():
     if args.command == "parse":
         doc = YMJDocument(args.path)
         if doc.valid_structure:
-            print(json.dumps({
-                "header": doc.header,
-                "body_preview": doc.body[:100] + "...",
-                "footer": doc.footer
-            }, indent=2, default=str))
+            print(
+                json.dumps(
+                    {
+                        "header": doc.header,
+                        "body_preview": doc.body[:100] + "...",
+                        "footer": doc.footer,
+                    },
+                    indent=2,
+                    default=str,
+                )
+            )
         else:
             print(json.dumps({"error": doc.errors}, indent=2))
 
@@ -378,22 +452,111 @@ def main():
         doc = YMJDocument(args.path)
         calc_hash = doc.calculate_hash() if doc.valid_structure else None
         stored_hash = doc.footer.get("payload_hash") if doc.valid_structure else None
-        
+
         print(f"Structure Valid: {doc.valid_structure}")
         if doc.errors:
             print("Errors:")
-            for e in doc.errors: print(f"  - {e}")
-        
+            for e in doc.errors:
+                print(f"  - {e}")
+
         if doc.valid_structure:
             if calc_hash == stored_hash:
                 print("Hash: OK")
             else:
-                print(f"Hash: STALE (Calculated: {calc_hash[:8]}..., Stored: {stored_hash[:8]}...)")
+                print(
+                    f"Hash: STALE (Calculated: {calc_hash[:8]}..., Stored: {stored_hash[:8]}...)"
+                )
 
     elif args.command == "enrich":
         doc = YMJDocument(args.path)
         res = _enrich_document(doc, use_embeddings=not args.no_embed)
         print(json.dumps(res, indent=2))
+
+    elif args.command == "enrich-all":
+        p = Path(args.path)
+        if not p.is_dir():
+            print(json.dumps({"error": "Path must be a directory"}), file=sys.stderr)
+            sys.exit(1)
+
+        ymj_files = list(p.rglob("*.ymj"))
+        total = len(ymj_files)
+
+        if total == 0:
+            print(json.dumps({"status": "no_files_found"}))
+            sys.exit(0)
+
+        print(f"Found {total} YMJ files. Starting bulk enrichment...", file=sys.stderr)
+
+        # Pre-initialize embedding model if needed (for GPU warmup)
+        if not args.no_embed:
+            print("Initializing GPU-accelerated embedding model...", file=sys.stderr)
+            try:
+                # CRITICAL: Import torch first to preload CUDA DLLs
+                import torch
+                from fastembed import TextEmbedding
+
+                _temp_model = TextEmbedding(
+                    model_name="nomic-ai/nomic-embed-text-v1.5",
+                    providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+                )
+                print("✓ Embedding model ready", file=sys.stderr)
+            except Exception as e:
+                print(
+                    f"Warning: GPU initialization failed, will use CPU: {e}",
+                    file=sys.stderr,
+                )
+
+        results = {"total": total, "updated": 0, "skipped": 0, "errors": 0}
+
+        for idx, file_path in enumerate(ymj_files, 1):
+            try:
+                doc = YMJDocument(str(file_path))
+
+                # Check if we should skip (has embedding and not --force)
+                has_embedding = (
+                    doc.valid_structure
+                    and "index" in doc.footer
+                    and "embedding" in doc.footer.get("index", {})
+                )
+
+                if has_embedding and not args.force and not args.no_embed:
+                    results["skipped"] += 1
+                    print(
+                        f"[{idx}/{total}] SKIP {file_path.name} (has embedding, use --force)",
+                        file=sys.stderr,
+                    )
+                    continue
+
+                res = _enrich_document(
+                    doc, use_embeddings=not args.no_embed, force_embedding=args.force
+                )
+
+                if "error" in res:
+                    results["errors"] += 1
+                    error_msg = res.get("error", "unknown")
+                    print(
+                        f"[{idx}/{total}] ✗ {file_path.name}: {error_msg}",
+                        file=sys.stderr,
+                    )
+                elif res.get("status") == "updated":
+                    results["updated"] += 1
+                    updates = ", ".join(res.get("updates", []))
+                    print(
+                        f"[{idx}/{total}] ✓ {file_path.name} ({updates})",
+                        file=sys.stderr,
+                    )
+                else:
+                    results["skipped"] += 1
+                    print(
+                        f"[{idx}/{total}] - {file_path.name} (no changes)",
+                        file=sys.stderr,
+                    )
+
+            except Exception as e:
+                results["errors"] += 1
+                print(f"[{idx}/{total}] ✗ {file_path.name}: {e}", file=sys.stderr)
+
+        print(json.dumps(results, indent=2))
 
     elif args.command == "migrate":
         p = Path(args.path)
@@ -413,12 +576,13 @@ def main():
                 doc = YMJDocument(str(f))
                 res = _upgrade_document(doc)
                 print(f"{f.name}: {res.get('status')} {res.get('updates', [])}")
-    
+
     else:
         if mcp:
             mcp.run()
         else:
             parser.print_help()
+
 
 if __name__ == "__main__":
     main()

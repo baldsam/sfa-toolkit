@@ -1,9 +1,39 @@
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.11,<3.14"
 # dependencies = [
 #     "fastmcp",
+#     "torch>=2.0.0",
+#     "onnxruntime-gpu>=1.18.0,<1.20.0",
+#     "fastembed-gpu",
+#     "numpy",
+# ]
+#
+# [[tool.uv.index]]
+# name = "pytorch-cu121"
+# url = "https://download.pytorch.org/whl/cu121"
+# explicit = true
+#
+# [[tool.uv.index]]
+# name = "onnxruntime-cu12"
+# url = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/"
+# explicit = true
+#
+# [tool.uv.sources]
+# torch = [
+#     { index = "pytorch-cu121", marker = "sys_platform == 'win32'" },
+# ]
+# onnxruntime-gpu = [
+#     { index = "onnxruntime-cu12", marker = "sys_platform == 'win32'" },
 # ]
 # ///
+#
+# GPU ACCELERATION CONFIGURATION (RTX 4090):
+# - fastembed-gpu includes onnxruntime-gpu for CUDA support
+# - PyTorch CUDA 12.1 wheel from pytorch.org index (not PyPI)
+# - explicit=true ensures only torch/torchvision use this index
+# - marker limits to Windows (CUDA builds not available on macOS)
+# - Must call TextEmbedding(..., providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+# - Result: 10-14x speedup (32 items/sec CPU -> 447 items/sec GPU @ batch=20)
 
 import argparse
 import csv
@@ -142,8 +172,8 @@ def _generate_semantic_text(
 
     # Perspective mapping
     perspective_map = {
-        "agent": "agent",
-        "user": "user",
+        "syne": "Syne",
+        "john": "John",
         "us": "We",
         "system": "The system",
         "agent": "An agent",
@@ -220,6 +250,72 @@ def _generate_semantic_text(
 
 # --- Core Logic ---
 
+# Lazy-load embedding model (expensive initialization)
+_embedding_model = None
+
+
+def _get_embedding_model():
+    """Get or initialize the GPU-accelerated embedding model."""
+    global _embedding_model
+    if _embedding_model is None:
+        try:
+            # Preload CUDA/cuDNN DLLs from PyTorch
+            # This makes PyTorch's bundled CUDA libs available to ONNX Runtime
+            import torch  # This loads CUDA DLLs into process memory
+
+            from fastembed import TextEmbedding
+
+            _embedding_model = TextEmbedding(
+                model_name="nomic-ai/nomic-embed-text-v1.5",
+                providers=[
+                    "CUDAExecutionProvider",
+                    "CPUExecutionProvider",
+                ],  # GPU -> CPU fallback
+            )
+        except ImportError as e:
+            raise RuntimeError(f"fastembed-gpu not installed: {e}")
+    return _embedding_model
+
+
+def _generate_embedding(text: str) -> List[float]:
+    """Generate embedding vector from text using GPU-accelerated model."""
+    model = _get_embedding_model()
+    embeddings = list(model.embed([text]))
+    return embeddings[0].tolist()
+
+
+def _write_semantics_row(
+    semantics_path: Path, node_id: str, semantic_text: str, embedding: List[float]
+) -> None:
+    """Write or update a row in graph_semantics.tsv."""
+    import csv
+
+    # Read existing rows
+    rows = []
+    if semantics_path.exists():
+        with open(semantics_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            rows = [
+                r for r in reader if r["id"] != node_id
+            ]  # Remove existing entry for this ID
+
+    # Add new row
+    rows.append(
+        {
+            "id": node_id,
+            "semantic_text": semantic_text,
+            "embedding": json.dumps(embedding),  # Store as JSON array
+        }
+    )
+
+    # Write all rows
+    with open(semantics_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["id", "semantic_text", "embedding"], delimiter="\t"
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
 
 def _init_graph_impl(path: str = "./graph.tsv") -> str:
     """Initialize a new empty graph.tsv file with headers."""
@@ -248,7 +344,7 @@ def _add_node_impl(
     new_id = id or _generate_id("item")
 
     # Check for ID collision
-    if any(r["id"] == new_id and not r["archived_date"] for r in rows):
+    if any(r["id"] == new_id and r.get("archived_date") == "ACTIVE" for r in rows):
         return f"Error: Active node with ID '{new_id}' already exists."
 
     timestamp = _now_iso()
@@ -265,7 +361,7 @@ def _add_node_impl(
     )
 
     new_row = {
-        "archived_date": "",
+        "archived_date": "ACTIVE",
         "id": new_id,
         "type": type,
         "stance": stance,
@@ -284,6 +380,20 @@ def _add_node_impl(
 
     rows.append(new_row)
     _write_graph(target, rows)
+
+    # DUAL-WRITE: Generate embedding and write to graph_semantics.tsv
+    try:
+        embedding = _generate_embedding(semantic_text)
+        semantics_path = target.parent / "graph_semantics.tsv"
+        _write_semantics_row(semantics_path, new_id, semantic_text, embedding)
+    except Exception as e:
+        # Rollback: remove the node we just added
+        rows = [r for r in rows if r["id"] != new_id]
+        _write_graph(target, rows)
+        return json.dumps({"error": f"Failed to generate embedding: {e}"}, indent=2)
+
+    # NOTE: No cache invalidation needed - per-row embeddings in graph_semantics.tsv
+
     return json.dumps(new_row, indent=2)
 
 
@@ -302,7 +412,7 @@ def _add_link_impl(
     rows = _read_graph(target)
 
     # Validate existence of source and target
-    active_ids = {r["id"] for r in rows if not r["archived_date"]}
+    active_ids = {r["id"] for r in rows if r.get("archived_date") == "ACTIVE"}
     if source_id not in active_ids:
         return f"Error: Source ID '{source_id}' not found or archived."
     if target_id not in active_ids:
@@ -325,7 +435,7 @@ def _add_link_impl(
     )
 
     new_row = {
-        "archived_date": "",
+        "archived_date": "ACTIVE",
         "id": _generate_id("link"),
         "type": "link",
         "stance": stance,
@@ -344,6 +454,21 @@ def _add_link_impl(
 
     rows.append(new_row)
     _write_graph(target, rows)
+
+    # DUAL-WRITE: Generate embedding and write to graph_semantics.tsv
+    link_id = new_row["id"]
+    try:
+        embedding = _generate_embedding(semantic_text)
+        semantics_path = target.parent / "graph_semantics.tsv"
+        _write_semantics_row(semantics_path, link_id, semantic_text, embedding)
+    except Exception as e:
+        # Rollback: remove the link we just added
+        rows = [r for r in rows if r["id"] != link_id]
+        _write_graph(target, rows)
+        return json.dumps({"error": f"Failed to generate embedding: {e}"}, indent=2)
+
+    # NOTE: No cache invalidation needed - per-row embeddings in graph_semantics.tsv
+
     return json.dumps(new_row, indent=2)
 
 
@@ -361,7 +486,7 @@ def _update_node_impl(
     # Find active row
     active_idx = -1
     for i, r in enumerate(rows):
-        if r["id"] == id and not r["archived_date"]:
+        if r["id"] == id and r.get("archived_date") == "ACTIVE":
             active_idx = i
             break
 
@@ -375,7 +500,7 @@ def _update_node_impl(
 
     # Create new row
     new_row = old_row.copy()
-    new_row["archived_date"] = ""
+    new_row["archived_date"] = "ACTIVE"
     new_row["timestamp"] = _now_iso()
 
     if content is not None:
@@ -403,7 +528,7 @@ def _query_graph_impl(
 
     results = []
     for r in rows:
-        if active_only and r["archived_date"]:
+        if active_only and r.get("archived_date") != "ACTIVE":
             continue
         if stance and r["stance"] != stance:
             continue
@@ -437,12 +562,175 @@ def _schema_impl() -> str:
     )
     output.append("\n  # My aspirations with certainty")
     output.append(
-        '  awk -F\'\\t\' \'$4=="aspiration" && $8=="agent" {print $6": "$11}\' graph.tsv'
+        '  awk -F\'\\t\' \'$4=="aspiration" && $8=="syne" {print $6": "$11}\' graph.tsv'
     )
     output.append("\n  # Stance distribution")
     output.append("  cut -f4 graph.tsv | sort | uniq -c")
 
     return "\n".join(output)
+
+
+def _semantic_query_impl(path: str, query: str, top_k: int = 10) -> str:
+    """
+    Semantic search on graph using embeddings.
+    Searches graph_semantics.tsv and returns matching graph IDs with full data.
+    """
+    import numpy as np
+
+    target = _normalize_path(path)
+    semantics_path = target.parent / "graph_semantics.tsv"
+
+    if not semantics_path.exists():
+        return json.dumps(
+            {"error": "graph_semantics.tsv not found. No embeddings available."},
+            indent=2,
+        )
+
+    # Generate query embedding
+    model = _get_embedding_model()
+    query_embedding = _generate_embedding(query)
+    query_vec = np.array(query_embedding)
+
+    # Read graph_semantics.tsv and compute similarities
+    import csv
+
+    candidates = []
+
+    with open(semantics_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for row in reader:
+            node_id = row["id"]
+            semantic_text = row["semantic_text"]
+            embedding = json.loads(row["embedding"])
+            embedding_vec = np.array(embedding)
+
+            # Cosine similarity
+            similarity = np.dot(query_vec, embedding_vec) / (
+                np.linalg.norm(query_vec) * np.linalg.norm(embedding_vec)
+            )
+
+            candidates.append(
+                {
+                    "id": node_id,
+                    "semantic_text": semantic_text,
+                    "score": float(similarity),
+                }
+            )
+
+    # Sort by similarity
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    top_matches = candidates[:top_k]
+
+    # Lookup full graph entries
+    rows = _read_graph(target)
+    id_to_row = {r["id"]: r for r in rows if r.get("archived_date") == "ACTIVE"}
+
+    results = []
+    for match in top_matches:
+        node_id = match["id"]
+        if node_id in id_to_row:
+            full_data = id_to_row[node_id].copy()
+            full_data["_semantic_score"] = match["score"]
+            results.append(full_data)
+
+    return json.dumps(results, indent=2)
+
+
+def _regenerate_semantics_impl(graph_path: str, force: bool = False) -> str:
+    """
+    Regenerate graph_semantics.tsv from graph.tsv.
+    If force=True, regenerate all embeddings.
+    If force=False, only add missing embeddings.
+    """
+    import csv
+
+    target = _normalize_path(graph_path)
+
+    if not target.exists():
+        return json.dumps({"error": "Graph file not found"})
+
+    semantics_path = target.parent / "graph_semantics.tsv"
+
+    # Read existing semantics if not forcing
+    existing_ids = set()
+    if not force and semantics_path.exists():
+        with open(semantics_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            existing_ids = {row["id"] for row in reader}
+
+    # Read graph.tsv
+    rows = _read_graph(target)
+    active_rows = [r for r in rows if r.get("archived_date") == "ACTIVE"]
+
+    total = len(active_rows)
+    if total == 0:
+        return json.dumps({"status": "no_active_rows", "total": 0})
+
+    # Initialize embedding model
+    print(f"Initializing GPU-accelerated embedding model...", file=sys.stderr)
+    model = _get_embedding_model()
+    print(f"✓ Embedding model ready", file=sys.stderr)
+
+    # Determine which rows need embeddings
+    to_process = []
+    for row in active_rows:
+        row_id = row["id"]
+        if force or row_id not in existing_ids:
+            to_process.append(row)
+
+    if len(to_process) == 0:
+        return json.dumps(
+            {"status": "all_current", "total": total, "processed": 0, "skipped": total}
+        )
+
+    print(f"Processing {len(to_process)}/{total} rows...", file=sys.stderr)
+
+    # If forcing, recreate file from scratch
+    if force:
+        with open(semantics_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f, delimiter="\t")
+            writer.writerow(["id", "semantic_text", "embedding"])
+
+    # Process rows and write
+    processed = 0
+    errors = 0
+
+    for idx, row in enumerate(to_process, 1):
+        try:
+            row_id = row["id"]
+            semantic_text = row["semantic_text"]
+
+            # Generate embedding
+            embedding = _generate_embedding(semantic_text)
+
+            # Write to semantics file
+            _write_semantics_row(semantics_path, row_id, semantic_text, embedding)
+
+            processed += 1
+            if processed % 10 == 0:
+                print(
+                    f"[{processed}/{len(to_process)}] Processed {row_id}",
+                    file=sys.stderr,
+                )
+
+        except Exception as e:
+            errors += 1
+            print(
+                f"✗ Error processing {row.get('id', 'unknown')}: {e}", file=sys.stderr
+            )
+
+    result = {
+        "status": "complete",
+        "total": total,
+        "processed": processed,
+        "skipped": total - len(to_process),
+        "errors": errors,
+    }
+
+    print(
+        f"\n✓ Regeneration complete: {processed} embeddings generated", file=sys.stderr
+    )
+    return json.dumps(result, indent=2)
 
 
 # --- MCP Tools ---
@@ -564,6 +852,25 @@ def main():
         "--all-history", action="store_true", help="Include archived rows"
     )
 
+    # Semantic Query
+    p_semantic = subparsers.add_parser(
+        "semantic-query", help="Semantic search on graph"
+    )
+    p_semantic.add_argument("path", help="Path to graph.tsv")
+    p_semantic.add_argument("query", help="Natural language query")
+    p_semantic.add_argument("--top", type=int, default=10, help="Number of results")
+
+    # Regenerate Semantics
+    p_regen = subparsers.add_parser(
+        "regenerate-semantics", help="Rebuild graph_semantics.tsv from graph.tsv"
+    )
+    p_regen.add_argument("path", help="Path to graph.tsv")
+    p_regen.add_argument(
+        "--force",
+        action="store_true",
+        help="Regenerate all embeddings (not just missing)",
+    )
+
     # Schema
     p_schema = subparsers.add_parser("schema", help="Display graph schema")
 
@@ -615,6 +922,10 @@ def main():
                 active_only=not args.all_history,
             )
         )
+    elif args.command == "semantic-query":
+        print(_semantic_query_impl(args.path, args.query, top_k=args.top))
+    elif args.command == "regenerate-semantics":
+        print(_regenerate_semantics_impl(args.path, force=args.force))
     elif args.command == "schema":
         print(_schema_impl())
     else:
