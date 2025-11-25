@@ -11,9 +11,10 @@
 Fish Audio TTS - Text-to-speech using Fish.audio
 
 Usage:
-  uv run --script sfa_tts_fish.py "(happy) text to speak"           # with emotion tag
+  uv run --script sfa_tts_fish.py "(happy) text to speak"              # positional
   uv run --script sfa_tts_fish.py --text "(confident) text to speak"   # named parameter
-  uv run --script sfa_tts_fish.py --text "text" --voice "reference_id"  # custom voice
+  echo "(excited) text to speak" | uv run --script sfa_tts_fish.py     # stdin (text first!)
+  uv run --script sfa_tts_fish.py --text "text" --voice "reference_id" # custom voice
 
 Environment:
   FISH_API_KEY: Fish.audio API key (required)
@@ -402,21 +403,13 @@ def say(
     # Single hyphen between words (not in compound words) -> (break)
     cleaned_text = re.sub(r"\s+-\s+", " (break) ", cleaned_text)
 
-    result = {"success": False, "error": None, "error_code": None}
+    # BYPASS: Strip emotion tags - Fish.audio works better without them
+    # Remove all (tag) patterns from the text
+    cleaned_text = re.sub(r"\([^)]+\)\s*", "", cleaned_text)
+    # Clean up any double spaces created by tag removal
+    cleaned_text = re.sub(r"\s+", " ", cleaned_text).strip()
 
-    # Validate emotion tags FIRST
-    valid, invalid_tags = validate_emotion_tags(cleaned_text)
-    if not valid:
-        result["error"] = (
-            f"Invalid emotion tags: {', '.join(invalid_tags)}. See supported tags below:"
-        )
-        result["error_code"] = "INVALID_EMOTION_TAGS"
-        result["invalid_tags"] = invalid_tags
-        # Print the catalog to help fix the error
-        print(json.dumps(result, indent=2))
-        print("\n" + "=" * 60)
-        show_emotion_catalog()
-        sys.exit(1)
+    result = {"success": False, "error": None, "error_code": None}
 
     try:
         if not cleaned_text or not cleaned_text.strip():
@@ -459,8 +452,8 @@ def say(
         return result
 
 
-def show_emotion_catalog():
-    """Display complete Fish.audio emotion tag catalog"""
+def print_catalog_stderr():
+    """Print emotion catalog to stderr for agent learning without cluttering UI"""
     catalog = """
 # Fish.audio Emotion Tags (64 supported)
 
@@ -488,7 +481,12 @@ def show_emotion_catalog():
 - Max 3 tags per sentence: (tag1)(tag2) Text here
 - Intensity modifiers: (slightly happy) (very sad) (extremely excited)
 """
-    print(catalog)
+    print(catalog, file=sys.stderr)
+
+
+def show_emotion_catalog():
+    """Display complete Fish.audio emotion tag catalog (for --tags flag)"""
+    print_catalog_stderr()
     sys.exit(0)
 
 
@@ -591,8 +589,8 @@ def main():
 
     args = parser.parse_args()
 
-    # Check if running as MCP
-    if len(sys.argv) == 1 and mcp:
+    # Check if running as MCP (no args AND no stdin pipe)
+    if len(sys.argv) == 1 and sys.stdin.isatty() and mcp:
         mcp.run()
         return
 
@@ -600,8 +598,18 @@ def main():
     if args.tags:
         show_emotion_catalog()
 
-    # Use named --text if provided, otherwise use positional text
+    # Use named --text if provided, otherwise use positional text, otherwise stdin
     text_to_speak = args.named_text or args.text
+
+    # Check if input is being piped via stdin
+    if not text_to_speak and not sys.stdin.isatty():
+        text_to_speak = sys.stdin.read().strip()
+        # Strip outer quotes if present (echo adds them)
+        if len(text_to_speak) >= 2:
+            if (text_to_speak[0] == "'" and text_to_speak[-1] == "'") or (
+                text_to_speak[0] == '"' and text_to_speak[-1] == '"'
+            ):
+                text_to_speak = text_to_speak[1:-1]
 
     if not text_to_speak:
         # If no text and no args (handled above), show help

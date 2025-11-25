@@ -112,7 +112,9 @@ class YMJDocument:
         # 1. Extract YAML Header
         # Must start with ---
         if not content.startswith("---"):
-            self.errors.append("Missing start YAML fence (---)")
+            self.errors.append(
+                "Missing start YAML fence. Expected format:\n---\nkey: value\n---\n"
+            )
             return
 
         # Find end of YAML
@@ -121,7 +123,9 @@ class YMJDocument:
         try:
             header_end_idx = content.index("\n---", 3)
         except ValueError:
-            self.errors.append("Missing end YAML fence")
+            self.errors.append(
+                "Missing end YAML fence. Expected format:\n---\nkey: value\n---\n"
+            )
             return
 
         header_str = content[3:header_end_idx].strip()
@@ -173,6 +177,36 @@ class YMJDocument:
         self.body = content[body_start:body_end].strip()
         self.valid_structure = len(self.errors) == 0
 
+        # Validate header fields after structure check
+        if self.valid_structure:
+            self._validate_header()
+
+    def _validate_header(self):
+        """Validate required header fields based on file location."""
+        # Check for doc_type field based on path
+        path_str = str(self.path)
+
+        if "knowledge" in path_str:
+            expected_doc_type = "knowledge"
+        elif "reference" in path_str:
+            expected_doc_type = "reference"
+        else:
+            # Not in knowledge or reference directory, skip doc_type check
+            return
+
+        actual_doc_type = self.header.get("doc_type")
+
+        if not actual_doc_type:
+            self.errors.append(
+                f"Missing required field: doc_type (expected '{expected_doc_type}')"
+            )
+            self.valid_structure = False
+        elif actual_doc_type != expected_doc_type:
+            self.errors.append(
+                f"Invalid doc_type: '{actual_doc_type}' (expected '{expected_doc_type}' based on path)"
+            )
+            self.valid_structure = False
+
     def calculate_hash(self) -> str:
         """Calculate SHA256 of the body."""
         return hashlib.sha256(self.body.encode("utf-8")).hexdigest()
@@ -188,6 +222,18 @@ class YMJDocument:
         new_content += "\n```\n"
 
         self.path.write_text(new_content, encoding="utf-8")
+
+    def get_markdown(self) -> str:
+        """Extract markdown body only (no YAML header or JSON footer)."""
+        return self.body
+
+    def get_yaml(self) -> str:
+        """Extract YAML header as formatted string."""
+        return yaml.dump(self.header, sort_keys=False, allow_unicode=True)
+
+    def get_json(self) -> str:
+        """Extract JSON footer as formatted string."""
+        return json.dumps(self.footer, indent=2, ensure_ascii=False)
 
 
 # --- Core Logic: Enrichment ---
@@ -290,6 +336,167 @@ def _upgrade_document(doc: YMJDocument) -> Dict[str, Any]:
     return {"status": "already_compliant"}
 
 
+# --- Core Logic: Reading ---
+
+
+def _read_markdown(path: str) -> str:
+    """
+    Extract markdown content from .ymj file(s), excluding YAML header and JSON footer.
+
+    If path is a file: extracts markdown from that file
+    If path is a folder: extracts markdown from all .ymj files in folder
+
+    Returns markdown content as string
+    """
+    path_obj = _normalize_path(path)
+
+    if not path_obj.exists():
+        raise FileNotFoundError(f"Path does not exist: {path}")
+
+    # Collect files to process
+    files_to_process = []
+
+    if path_obj.is_file():
+        if path_obj.suffix != ".ymj":
+            raise ValueError("File is not a .ymj file")
+        files_to_process.append(path_obj)
+    elif path_obj.is_dir():
+        # Find all .ymj files in directory
+        files_to_process = list(path_obj.glob("*.ymj"))
+        if not files_to_process:
+            raise FileNotFoundError("No .ymj files found in directory")
+    else:
+        raise ValueError(f"Path type not supported: {path}")
+
+    # Extract markdown from each file
+    results = []
+
+    for file_path in files_to_process:
+        doc = YMJDocument(str(file_path))
+        if not doc.valid_structure:
+            print(
+                f"Warning: Skipping {file_path.name} - invalid structure",
+                file=sys.stderr,
+            )
+            continue
+
+        markdown_content = doc.get_markdown()
+
+        # Add file header if processing multiple files
+        if len(files_to_process) > 1:
+            results.append(f"# {file_path.name}\n\n{markdown_content}")
+        else:
+            results.append(markdown_content)
+
+    if not results:
+        raise ValueError("Failed to extract markdown from any files")
+
+    # Combine all results
+    return "\n\n---\n\n".join(results)
+
+
+def _read_yaml(path: str) -> str:
+    """
+    Extract YAML header from .ymj file(s).
+
+    Returns YAML content as string
+    """
+    path_obj = _normalize_path(path)
+
+    if not path_obj.exists():
+        raise FileNotFoundError(f"Path does not exist: {path}")
+
+    # Collect files to process
+    files_to_process = []
+
+    if path_obj.is_file():
+        if path_obj.suffix != ".ymj":
+            raise ValueError("File is not a .ymj file")
+        files_to_process.append(path_obj)
+    elif path_obj.is_dir():
+        files_to_process = list(path_obj.glob("*.ymj"))
+        if not files_to_process:
+            raise FileNotFoundError("No .ymj files found in directory")
+    else:
+        raise ValueError(f"Path type not supported: {path}")
+
+    # Extract YAML from each file
+    results = []
+
+    for file_path in files_to_process:
+        doc = YMJDocument(str(file_path))
+        if not doc.valid_structure:
+            print(
+                f"Warning: Skipping {file_path.name} - invalid structure",
+                file=sys.stderr,
+            )
+            continue
+
+        yaml_content = doc.get_yaml()
+
+        # Add file header if processing multiple files
+        if len(files_to_process) > 1:
+            results.append(f"# {file_path.name}\n---\n{yaml_content}---")
+        else:
+            results.append(yaml_content)
+
+    if not results:
+        raise ValueError("Failed to extract YAML from any files")
+
+    return "\n\n".join(results)
+
+
+def _read_json(path: str) -> str:
+    """
+    Extract JSON footer from .ymj file(s).
+
+    Returns JSON content as string
+    """
+    path_obj = _normalize_path(path)
+
+    if not path_obj.exists():
+        raise FileNotFoundError(f"Path does not exist: {path}")
+
+    # Collect files to process
+    files_to_process = []
+
+    if path_obj.is_file():
+        if path_obj.suffix != ".ymj":
+            raise ValueError("File is not a .ymj file")
+        files_to_process.append(path_obj)
+    elif path_obj.is_dir():
+        files_to_process = list(path_obj.glob("*.ymj"))
+        if not files_to_process:
+            raise FileNotFoundError("No .ymj files found in directory")
+    else:
+        raise ValueError(f"Path type not supported: {path}")
+
+    # Extract JSON from each file
+    results = []
+
+    for file_path in files_to_process:
+        doc = YMJDocument(str(file_path))
+        if not doc.valid_structure:
+            print(
+                f"Warning: Skipping {file_path.name} - invalid structure",
+                file=sys.stderr,
+            )
+            continue
+
+        json_content = doc.get_json()
+
+        # Add file header if processing multiple files
+        if len(files_to_process) > 1:
+            results.append(f"# {file_path.name}\n{json_content}")
+        else:
+            results.append(json_content)
+
+    if not results:
+        raise ValueError("Failed to extract JSON from any files")
+
+    return "\n\n".join(results)
+
+
 # --- Core Logic: Migration ---
 
 
@@ -361,6 +568,30 @@ if mcp:
         )
 
     @mcp.tool()
+    def ymj_read_markdown(path: str) -> str:
+        """Extract markdown content from .ymj file(s), excluding YAML header and JSON footer."""
+        try:
+            return _read_markdown(path)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    @mcp.tool()
+    def ymj_read_yaml(path: str) -> str:
+        """Extract YAML header from .ymj file(s)."""
+        try:
+            return _read_yaml(path)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    @mcp.tool()
+    def ymj_read_json(path: str) -> str:
+        """Extract JSON footer from .ymj file(s)."""
+        try:
+            return _read_json(path)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    @mcp.tool()
     def ymj_lint(path: str) -> str:
         """Check YMJ file validity."""
         doc = YMJDocument(path)
@@ -391,6 +622,20 @@ def main():
     # parse
     parse_parser = subparsers.add_parser("parse", help="Parse YMJ file")
     parse_parser.add_argument("path", help="File path")
+
+    # read-markdown
+    read_md_parser = subparsers.add_parser(
+        "read-markdown", help="Extract markdown content (no YAML/JSON)"
+    )
+    read_md_parser.add_argument("path", help="File or directory path")
+
+    # read-yaml
+    read_yaml_parser = subparsers.add_parser("read-yaml", help="Extract YAML header")
+    read_yaml_parser.add_argument("path", help="File or directory path")
+
+    # read-json
+    read_json_parser = subparsers.add_parser("read-json", help="Extract JSON footer")
+    read_json_parser.add_argument("path", help="File or directory path")
 
     # lint
     lint_parser = subparsers.add_parser("lint", help="Validate YMJ file")
@@ -447,6 +692,48 @@ def main():
             )
         else:
             print(json.dumps({"error": doc.errors}, indent=2))
+
+    elif args.command == "read-markdown":
+        try:
+            # Ensure UTF-8 output on Windows
+            import io
+
+            sys.stdout = io.TextIOWrapper(
+                sys.stdout.buffer, encoding="utf-8", errors="replace"
+            )
+            markdown = _read_markdown(args.path)
+            print(markdown)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    elif args.command == "read-yaml":
+        try:
+            # Ensure UTF-8 output on Windows
+            import io
+
+            sys.stdout = io.TextIOWrapper(
+                sys.stdout.buffer, encoding="utf-8", errors="replace"
+            )
+            yaml_content = _read_yaml(args.path)
+            print(yaml_content)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    elif args.command == "read-json":
+        try:
+            # Ensure UTF-8 output on Windows
+            import io
+
+            sys.stdout = io.TextIOWrapper(
+                sys.stdout.buffer, encoding="utf-8", errors="replace"
+            )
+            json_content = _read_json(args.path)
+            print(json_content)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
 
     elif args.command == "lint":
         doc = YMJDocument(args.path)
