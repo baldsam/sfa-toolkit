@@ -121,6 +121,10 @@ def _get_transcript_via_api(
     language: str = "en",
     with_timestamps: bool = False,
     format: str = "lines",
+    http_proxy: Optional[str] = None,
+    https_proxy: Optional[str] = None,
+    cursor: Optional[str] = None,
+    response_limit: int = 50000,
 ) -> Dict[str, Any]:
     """Try fetching transcript via youtube_transcript_api (>= 0.6.0).
 
@@ -129,21 +133,60 @@ def _get_transcript_via_api(
         language: Language code (default: "en")
         with_timestamps: Include timestamps in output
         format: Output format - "lines" (one per subtitle), "continuous" (space-joined), "paragraphs" (grouped by gaps)
+        http_proxy: HTTP proxy URL
+        https_proxy: HTTPS proxy URL
+        cursor: Pagination cursor (start index)
+        response_limit: Max chars per response (for pagination)
     """
     if not YOUTUBE_API_AVAILABLE:
         return {"success": False, "error": "youtube_transcript_api not installed"}
 
     try:
+        # Set up proxies if provided
+        proxies = {}
+        if http_proxy:
+            proxies["http"] = http_proxy
+        if https_proxy:
+            proxies["https"] = https_proxy
+
         # New API: Create instance and fetch
         api = YouTubeTranscriptApi()
-        result = api.fetch(video_id, languages=(language, "en"))
+        if proxies:
+            # Note: youtube-transcript-api uses requests internally, proxies work via env vars
+            # We'll set them temporarily if provided
+            old_http = os.environ.get("HTTP_PROXY")
+            old_https = os.environ.get("HTTPS_PROXY")
+            if http_proxy:
+                os.environ["HTTP_PROXY"] = http_proxy
+            if https_proxy:
+                os.environ["HTTPS_PROXY"] = https_proxy
+
+        try:
+            result = api.fetch(video_id, languages=(language, "en"))
+        finally:
+            # Restore original proxy settings
+            if proxies:
+                if old_http is not None:
+                    os.environ["HTTP_PROXY"] = old_http
+                elif "HTTP_PROXY" in os.environ:
+                    del os.environ["HTTP_PROXY"]
+                if old_https is not None:
+                    os.environ["HTTPS_PROXY"] = old_https
+                elif "HTTPS_PROXY" in os.environ:
+                    del os.environ["HTTPS_PROXY"]
 
         # Format output
         lines = []
         formatted_entries = []
         prev_end = 0
 
-        for snippet in result.snippets:
+        # Parse cursor (start index)
+        start_idx = int(cursor) if cursor else 0
+
+        for i, snippet in enumerate(result.snippets):
+            if i < start_idx:
+                continue
+
             text = snippet.text.replace("\n", " ")
             start = snippet.start
             duration = snippet.duration
@@ -168,6 +211,17 @@ def _get_transcript_via_api(
                 {"text": text, "start": start, "duration": duration}
             )
 
+            # Check if we've hit the response limit
+            current_text = (
+                "\n".join(lines) if format != "continuous" else " ".join(lines)
+            )
+            if len(current_text) >= response_limit and i < len(result.snippets) - 1:
+                # More content available, return next cursor
+                next_cursor = str(i + 1)
+                break
+        else:
+            next_cursor = None
+
         # Join based on format
         if format == "continuous":
             final_text = " ".join(lines)
@@ -176,7 +230,7 @@ def _get_transcript_via_api(
         else:  # lines (default)
             final_text = "\n".join(lines)
 
-        return {
+        response = {
             "success": True,
             "method": "api",
             "language": result.language_code,
@@ -184,6 +238,12 @@ def _get_transcript_via_api(
             "text": final_text,
             "transcript": formatted_entries,
         }
+
+        if next_cursor:
+            response["next_cursor"] = next_cursor
+            response["has_more"] = True
+
+        return response
 
     except (TranscriptsDisabled, VideoUnavailable) as e:
         return {"success": False, "error": str(e)}
@@ -271,21 +331,55 @@ def _is_youtube_url(url: str) -> bool:
 
 
 def _fetch_youtube_transcript(
-    url: str, language: str = "en", timestamps: bool = False, format: str = "lines"
+    url: str,
+    language: str = "en",
+    timestamps: bool = False,
+    format: str = "lines",
+    http_proxy: Optional[str] = None,
+    https_proxy: Optional[str] = None,
+    cursor: Optional[str] = None,
+    response_limit: int = 50000,
 ) -> Dict[str, Any]:
-    """Fetch YouTube transcript with API -> yt-dlp fallback."""
+    """Fetch YouTube transcript with API -> yt-dlp fallback.
+
+    Args:
+        url: YouTube URL or video ID
+        language: Language code
+        timestamps: Include timestamps
+        format: Output format (lines/continuous/paragraphs)
+        http_proxy: HTTP proxy URL
+        https_proxy: HTTPS proxy URL
+        cursor: Pagination cursor
+        response_limit: Max chars per response
+    """
     try:
         video_id = _extract_video_id(url)
 
+        # Get proxies from env if not provided
+        if http_proxy is None:
+            http_proxy = os.environ.get("HTTP_PROXY")
+        if https_proxy is None:
+            https_proxy = os.environ.get("HTTPS_PROXY")
+
         # 1. Try API
-        result = _get_transcript_via_api(video_id, language, timestamps, format)
+        result = _get_transcript_via_api(
+            video_id,
+            language,
+            timestamps,
+            format,
+            http_proxy,
+            https_proxy,
+            cursor,
+            response_limit,
+        )
         if result["success"]:
             return result
 
-        # 2. Try yt-dlp
-        result = _get_transcript_via_ytdlp(video_id)
-        if result["success"]:
-            return result
+        # 2. Try yt-dlp (no pagination support for fallback)
+        if cursor is None:  # Only try fallback on first request
+            result = _get_transcript_via_ytdlp(video_id)
+            if result["success"]:
+                return result
 
         return {
             "success": False,
@@ -530,19 +624,41 @@ if mcp:
 
     @mcp.tool()
     def youtube_transcript(
-        url: str, language: str = "en", timestamps: bool = False, format: str = "lines"
+        url: str,
+        language: str = "en",
+        timestamps: bool = False,
+        format: str = "lines",
+        cursor: str = None,
+        response_limit: int = 50000,
     ) -> str:
         """
         Fetch YouTube transcript with hybrid extraction (API + yt-dlp fallback).
+        Supports pagination for long transcripts.
+
         Args:
             url: YouTube URL or video ID
             language: Language code (default: en)
             timestamps: Include timestamps in output
             format: Output format - "lines" (default, one per subtitle), "continuous" (space-joined), "paragraphs" (grouped by gaps)
+            cursor: Pagination cursor (from previous response's next_cursor)
+            response_limit: Max characters per response (default: 50000)
+
+        Returns:
+            Transcript text. If paginated, response will include next_cursor for subsequent requests.
         """
-        result = _fetch_youtube_transcript(url, language, timestamps, format)
+        result = _fetch_youtube_transcript(
+            url,
+            language,
+            timestamps,
+            format,
+            cursor=cursor,
+            response_limit=response_limit,
+        )
         if result["success"]:
-            return result["text"]
+            text = result["text"]
+            if result.get("next_cursor"):
+                text += f"\n\n[TRUNCATED - More content available. Use cursor: {result['next_cursor']}]"
+            return text
         else:
             return f"Error: {result.get('error')}"
 
@@ -583,6 +699,19 @@ def main():
         help="Output format: lines (one per subtitle), continuous (space-joined), paragraphs (grouped by gaps)",
     )
     yt_parser.add_argument(
+        "--http-proxy", help="HTTP proxy URL (or set HTTP_PROXY env var)"
+    )
+    yt_parser.add_argument(
+        "--https-proxy", help="HTTPS proxy URL (or set HTTPS_PROXY env var)"
+    )
+    yt_parser.add_argument("--cursor", help="Pagination cursor from previous response")
+    yt_parser.add_argument(
+        "--response-limit",
+        type=int,
+        default=50000,
+        help="Max characters per response for pagination (default: 50000)",
+    )
+    yt_parser.add_argument(
         "--json", action="store_true", help="Output full JSON result"
     )
 
@@ -607,13 +736,25 @@ def main():
                 print(f"Tip: Use 'sfa_ymj.py' to manage this file.")
     elif args.command == "youtube":
         result = _fetch_youtube_transcript(
-            args.url, args.lang, args.timestamps, args.format
+            args.url,
+            args.lang,
+            args.timestamps,
+            args.format,
+            http_proxy=getattr(args, "http_proxy", None),
+            https_proxy=getattr(args, "https_proxy", None),
+            cursor=getattr(args, "cursor", None),
+            response_limit=getattr(args, "response_limit", 50000),
         )
         if args.json:
             print(json.dumps(result, indent=2))
         else:
             if result["success"]:
                 print(result["text"])
+                if result.get("next_cursor"):
+                    print(
+                        f"\n[TRUNCATED - More content available. Use --cursor {result['next_cursor']}]",
+                        file=sys.stderr,
+                    )
             else:
                 print(f"Error: {result.get('error')}", file=sys.stderr)
                 sys.exit(1)
