@@ -696,6 +696,78 @@ def read_file(
         return (False, "", f"Read error: {str(e)}")
 
 
+def write_file(
+    file_path: str,
+    file_content: str,
+    backup: bool = True
+) -> Tuple[bool, str, str]:
+    """Write content to file, creating if needed."""
+    path_obj = Path(file_path).resolve()
+    resolved = str(path_obj)
+    _log(f"Writing to {file_path}", level=2)
+
+    # Backup if file exists
+    if backup and path_obj.exists():
+        _backup_file(resolved)
+
+    # Create parent directories if needed
+    parent = path_obj.parent
+    if parent and not parent.exists():
+        parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with open(resolved, 'w', encoding='utf-8') as f:
+            f.write(file_content)
+        return True, f"Wrote {len(file_content)} bytes to {resolved}", ""
+    except Exception as e:
+        return False, "", f"Write failed: {e}"
+
+
+def extract_markdown(file_path: str) -> Tuple[bool, str, str]:
+    """Extract markdown content from .ymj file, stripping YAML header and JSON footer."""
+    path_obj = Path(file_path).resolve()
+    resolved = str(path_obj)
+    _log(f"Extracting markdown from {file_path}", level=2)
+
+    if not path_obj.exists():
+        return False, "", f"File not found: {resolved}"
+
+    try:
+        with open(resolved, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        lines = content.split('\n')
+        result_lines = []
+        in_yaml = False
+        yaml_ended = False
+
+        for i, line in enumerate(lines):
+            # Detect YAML header start
+            if i == 0 and line.strip() == '---':
+                in_yaml = True
+                continue
+            # Detect YAML header end
+            if in_yaml and line.strip() == '---':
+                in_yaml = False
+                yaml_ended = True
+                continue
+            # Skip YAML content
+            if in_yaml:
+                continue
+            # Detect JSON footer (line starting with { or [)
+            if yaml_ended and line.strip() and line.strip()[0] in '{[':
+                break
+            result_lines.append(line)
+
+        # Strip trailing blank lines
+        while result_lines and not result_lines[-1].strip():
+            result_lines.pop()
+
+        return True, '\n'.join(result_lines), ""
+    except Exception as e:
+        return False, "", f"Extract failed: {e}"
+
+
 def search(
     path: str,
     pattern: str,
@@ -1666,7 +1738,7 @@ def cli_main():
     verify_parser = subparsers.add_parser("verify", help="Verify path exists")
     verify_parser.add_argument("path", help="Path to verify")
 
-    list_parser = subparsers.add_parser("list", help="List directory contents")
+    list_parser = subparsers.add_parser("list", aliases=["ls"], help="List directory contents")
     list_parser.add_argument("path", help="Directory to list")
     list_parser.add_argument(
         "--mode",
@@ -1675,19 +1747,19 @@ def cli_main():
         help="Output format",
     )
 
-    delete_parser = subparsers.add_parser("delete", help="Delete file or directory")
+    delete_parser = subparsers.add_parser("delete", aliases=["rm"], help="Delete file or directory")
     delete_parser.add_argument("path", help="Path to delete")
     delete_parser.add_argument(
         "-r", "--recursive", action="store_true", help="Delete directories recursively"
     )
     delete_parser.add_argument("--no-backup", action="store_true", help="Skip backup")
 
-    move_parser = subparsers.add_parser("move", help="Move/rename file or directory")
+    move_parser = subparsers.add_parser("move", aliases=["mv"], help="Move/rename file or directory")
     move_parser.add_argument("source", help="Source path")
     move_parser.add_argument("destination", help="Destination path")
     move_parser.add_argument("--no-backup", action="store_true", help="Skip backup")
 
-    copy_parser = subparsers.add_parser("copy", help="Copy file or directory")
+    copy_parser = subparsers.add_parser("copy", aliases=["cp"], help="Copy file or directory")
     copy_parser.add_argument("source", help="Source path")
     copy_parser.add_argument("destination", help="Destination path")
     copy_parser.add_argument(
@@ -1706,14 +1778,14 @@ def cli_main():
     )
 
     # Reading commands
-    read_parser = subparsers.add_parser("read", help="Read file contents with line numbers")
+    read_parser = subparsers.add_parser("read", aliases=["r"], help="Read file contents with line numbers")
     read_parser.add_argument("file", help="File to read")
     read_parser.add_argument("--offset", type=int, default=0, help="Start from line N (1-indexed)")
     read_parser.add_argument("--limit", type=int, help="Max lines to read")
     read_parser.add_argument("--raw", action="store_true", help="No line numbers")
     read_parser.add_argument("--encoding", default="utf-8", help="File encoding")
 
-    search_parser = subparsers.add_parser("search", help="Search for regex pattern in files")
+    search_parser = subparsers.add_parser("search", aliases=["s"], help="Search for regex pattern in files")
     search_parser.add_argument("path", help="File or directory to search")
     search_parser.add_argument("pattern", help="Regex pattern")
     search_parser.add_argument("-A", "--after", type=int, default=0, help="Lines after match")
@@ -1724,18 +1796,35 @@ def cli_main():
     search_parser.add_argument("-i", "--ignore-case", action="store_true", help="Case insensitive")
     search_parser.add_argument("--no-recursive", action="store_true", help="Don't recurse directories")
 
-    line_get_parser = subparsers.add_parser("line-get", help="Get specific line(s)")
+    line_get_parser = subparsers.add_parser("line-get", aliases=["lg"], help="Get specific line(s)")
     line_get_parser.add_argument("file", help="File path")
     line_get_parser.add_argument("range", help="Line range (10, 10-20, 10-, -20)")
 
-    line_delete_range_parser = subparsers.add_parser("line-delete-range", help="Delete range of lines")
+    line_delete_range_parser = subparsers.add_parser("line-delete-range", aliases=["ldr"], help="Delete range of lines")
     line_delete_range_parser.add_argument("file", help="File path")
     line_delete_range_parser.add_argument("range", help="Line range (10, 10-20, 10-, -20)")
     line_delete_range_parser.add_argument("--no-backup", action="store_true", help="Skip backup")
 
+    # Write command
+    write_parser = subparsers.add_parser("write", aliases=["w"], help="Write content to file")
+    write_parser.add_argument("file", help="File to write")
+    write_parser.add_argument("content", help="Content to write (use @file to read from file)")
+    write_parser.add_argument("--no-backup", action="store_true", help="Skip backup if file exists")
+
+    # Extract-markdown command
+    extract_md_parser = subparsers.add_parser("extract-markdown", aliases=["xmd"], help="Extract markdown from .ymj")
+    extract_md_parser.add_argument("file", help="YMJ file to extract from")
+
+    # Char-replace command
+    char_replace_parser = subparsers.add_parser("char-replace", aliases=["cr"], help="Character-level replace")
+    char_replace_parser.add_argument("file", help="File to modify")
+    char_replace_parser.add_argument("old", help="Character(s) to replace")
+    char_replace_parser.add_argument("new", help="Replacement character(s)")
+    char_replace_parser.add_argument("--no-backup", action="store_true", help="Skip backup")
+
     # Content manipulation commands
     line_replace_parser = subparsers.add_parser(
-        "line-replace", help="Replace entire line"
+        "line-replace", aliases=["lr"], help="Replace entire line"
     )
     line_replace_parser.add_argument("file", help="File path")
     line_replace_parser.add_argument(
@@ -1746,7 +1835,7 @@ def cli_main():
         "--no-backup", action="store_true", help="Skip backup"
     )
 
-    line_insert_parser = subparsers.add_parser("line-insert", help="Insert new line")
+    line_insert_parser = subparsers.add_parser("line-insert", aliases=["li"], help="Insert new line")
     line_insert_parser.add_argument("file", help="File path")
     line_insert_parser.add_argument(
         "line_num", type=int, help="Line number (1-indexed)"
@@ -1756,7 +1845,7 @@ def cli_main():
         "--no-backup", action="store_true", help="Skip backup"
     )
 
-    line_delete_parser = subparsers.add_parser("line-delete", help="Delete line")
+    line_delete_parser = subparsers.add_parser("line-delete", aliases=["ld"], help="Delete line")
     line_delete_parser.add_argument("file", help="File path")
     line_delete_parser.add_argument(
         "line_num", type=int, help="Line number (1-indexed)"
@@ -1765,7 +1854,7 @@ def cli_main():
         "--no-backup", action="store_true", help="Skip backup"
     )
 
-    line_append_parser = subparsers.add_parser("line-append", help="Append line to end")
+    line_append_parser = subparsers.add_parser("line-append", aliases=["la"], help="Append line to end")
     line_append_parser.add_argument("file", help="File path")
     line_append_parser.add_argument("content", help="Content to append")
     line_append_parser.add_argument(
@@ -1773,7 +1862,7 @@ def cli_main():
     )
 
     line_prepend_parser = subparsers.add_parser(
-        "line-prepend", help="Prepend line to beginning"
+        "line-prepend", aliases=["lp"], help="Prepend line to beginning"
     )
     line_prepend_parser.add_argument("file", help="File path")
     line_prepend_parser.add_argument("content", help="Content to prepend")
@@ -1782,7 +1871,7 @@ def cli_main():
     )
 
     block_replace_parser = subparsers.add_parser(
-        "block-replace", help="Replace multi-line block"
+        "block-replace", aliases=["br"], help="Replace multi-line block"
     )
     block_replace_parser.add_argument("file", help="File path")
     block_replace_parser.add_argument("old_block", help="Block to replace")
@@ -1833,42 +1922,53 @@ def cli_main():
         result = create(args.path, args.parents)
     elif args.command == "verify":
         result = verify(args.path)
-    elif args.command == "list":
+    elif args.command in ("list", "ls"):
         result = list_path(args.path, args.mode)
-    elif args.command == "delete":
+    elif args.command in ("delete", "rm"):
         result = delete(args.path, args.recursive, not args.no_backup)
-    elif args.command == "move":
+    elif args.command in ("move", "mv"):
         result = move(args.source, args.destination, not args.no_backup)
-    elif args.command == "copy":
+    elif args.command in ("copy", "cp"):
         result = copy(args.source, args.destination, args.recursive)
     elif args.command == "tree":
         result = tree(args.path, args.depth)
     elif args.command == "find":
         result = find_files(args.path, args.pattern, args.type)
-    elif args.command == "read":
+    elif args.command in ("read", "r"):
         result = read_file(args.file, args.offset, args.limit, args.raw, args.encoding)
-    elif args.command == "search":
+    elif args.command in ("search", "s"):
         result = search(
             args.path, args.pattern, args.before, args.after, args.context,
             args.count, args.files_only, args.ignore_case, not args.no_recursive
         )
-    elif args.command == "line-get":
+    elif args.command in ("line-get", "lg"):
         result = line_get(args.file, args.range)
-    elif args.command == "line-delete-range":
+    elif args.command in ("line-delete-range", "ldr"):
         result = line_delete_range(args.file, args.range, not args.no_backup)
-    elif args.command == "line-replace":
+    elif args.command in ("write", "w"):
+        content = args.content
+        # Support @file syntax to read content from file
+        if content.startswith('@') and os.path.exists(content[1:]):
+            with open(content[1:], 'r', encoding='utf-8') as f:
+                content = f.read()
+        result = write_file(args.file, content, not args.no_backup)
+    elif args.command in ("extract-markdown", "xmd"):
+        result = extract_markdown(args.file)
+    elif args.command in ("char-replace", "cr"):
+        result = char_replace(args.file, args.old, args.new, not args.no_backup)
+    elif args.command in ("line-replace", "lr"):
         result = line_replace(
             args.file, args.line_num, args.content, not args.no_backup
         )
-    elif args.command == "line-insert":
+    elif args.command in ("line-insert", "li"):
         result = line_insert(args.file, args.line_num, args.content, not args.no_backup)
-    elif args.command == "line-delete":
+    elif args.command in ("line-delete", "ld"):
         result = line_delete(args.file, args.line_num, not args.no_backup)
-    elif args.command == "line-append":
+    elif args.command in ("line-append", "la"):
         result = line_append(args.file, args.content, not args.no_backup)
-    elif args.command == "line-prepend":
+    elif args.command in ("line-prepend", "lp"):
         result = line_prepend(args.file, args.content, not args.no_backup)
-    elif args.command == "block-replace":
+    elif args.command in ("block-replace", "br"):
         result = block_replace(
             args.file, args.old_block, args.new_block,
             backup=not args.no_backup,
