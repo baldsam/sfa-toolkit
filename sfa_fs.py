@@ -1583,6 +1583,58 @@ if mcp:
         return f"[OK] Removed duplicates from {file_path}"
 
 
+
+    @mcp.tool()
+    async def fs_read(
+        file_path: str,
+        offset: int = None,
+        limit: int = None,
+        raw: bool = False
+    ) -> str:
+        """Read file contents with line numbers. Use offset/limit for large files."""
+        success, stdout_data, error_msg = read_file(file_path, offset, limit, raw)
+        if not success:
+            return f"[FAIL] {error_msg}"
+        return stdout_data
+
+    @mcp.tool()
+    async def fs_search(
+        path: str,
+        pattern: str,
+        case_insensitive: bool = False,
+        context_lines: int = 0,
+        files_only: bool = False,
+        count_only: bool = False
+    ) -> str:
+        """Search for regex pattern in files. Returns matches or file list."""
+        success, stdout_data, error_msg = search(
+            path, pattern, case_insensitive, context_lines, files_only, count_only
+        )
+        if not success:
+            return f"[FAIL] {error_msg}"
+        return stdout_data if stdout_data else "[OK] No matches found"
+
+    @mcp.tool()
+    async def fs_line_get(file_path: str, line_range: str) -> str:
+        """Get specific line(s). Range formats: 10, 10-20, 10-, -20"""
+        success, stdout_data, error_msg = line_get(file_path, line_range)
+        if not success:
+            return f"[FAIL] {error_msg}"
+        return stdout_data
+
+    @mcp.tool()
+    async def fs_line_delete_range(
+        file_path: str,
+        line_range: str,
+        backup: bool = True
+    ) -> str:
+        """Delete range of lines. Range formats: 10-20, 10-, -20"""
+        success, stdout_data, error_msg = line_delete_range(file_path, line_range, backup)
+        if not success:
+            return f"[FAIL] {error_msg}"
+        return f"[OK] Deleted lines {line_range} from {file_path}"
+
+
 # --- CLI ---
 
 
