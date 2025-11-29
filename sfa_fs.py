@@ -1784,6 +1784,7 @@ def cli_main():
     read_parser.add_argument("--limit", type=int, help="Max lines to read")
     read_parser.add_argument("--raw", action="store_true", help="No line numbers")
     read_parser.add_argument("--encoding", default="utf-8", help="File encoding")
+    read_parser.add_argument("--force", "-f", action="store_true", help="Force read of large files (>500 lines)")
 
     search_parser = subparsers.add_parser("search", aliases=["s"], help="Search for regex pattern in files")
     search_parser.add_argument("path", help="File or directory to search")
@@ -1935,6 +1936,20 @@ def cli_main():
     elif args.command == "find":
         result = find_files(args.path, args.pattern, args.type)
     elif args.command in ("read", "r"):
+        # Large file protection
+        LARGE_FILE_THRESHOLD = 500
+        file_path = Path(args.file).resolve()
+        if file_path.exists() and file_path.is_file() and not args.limit and not args.force:
+            try:
+                with open(file_path, "r", encoding=args.encoding, errors="replace") as f:
+                    line_count = sum(1 for _ in f)
+                if line_count > LARGE_FILE_THRESHOLD:
+                    est_tokens = line_count * 5  # rough estimate
+                    print(f"⚠ File is {line_count:,} lines (~{est_tokens:,} tokens)")
+                    print(f"  Use --force to read anyway, or --limit N for partial read")
+                    sys.exit(1)
+            except Exception:
+                pass  # If we cant count, proceed with read
         result = read_file(args.file, args.offset, args.limit, args.raw, args.encoding)
     elif args.command in ("search", "s"):
         result = search(
